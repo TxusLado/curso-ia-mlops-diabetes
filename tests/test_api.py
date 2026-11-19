@@ -72,3 +72,20 @@ def test_model_info(cliente):
     assert datos["version"] == "1"
     assert datos["alias"] == "champion"
     assert datos["run_id"]
+
+
+def test_error_interno(cliente, registro):
+    from unittest.mock import patch
+
+    class ModeloQueFalla:
+        def predict(self, datos):
+            raise ValueError("Fallo simulado")
+
+    with patch(
+        "src.api.main.get_model",
+        return_value=ModeloQueFalla()
+    ):
+        respuesta = cliente.post("/predict", json=registro)
+
+    assert respuesta.status_code == 500
+    assert respuesta.json()["detail"] == "Prediction error."
