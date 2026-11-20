@@ -1,0 +1,15 @@
+# Estado local de MLflow: se reconstruye en GitHub Actions
+mlflow.db
+mlflow.db-*
+mlruns/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Archivos locales
+.env
+.env.*
+respaldo_mlflow*.zip
