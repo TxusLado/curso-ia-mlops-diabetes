@@ -1,5 +1,9 @@
+# Integracion continua del proyecto MLOps de diabetes.
+# Objetivo: comprobar automaticamente que todo el proceso sigue funcionando.
+
 name: CI - Diabetes MLOps
 
+# Ejecutar al cambiar main, al proponer cambios o manualmente.
 on:
   push:
     branches: [main]
@@ -7,11 +11,13 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Solo necesitamos permiso para leer el codigo del repositorio.
 permissions:
   contents: read
 
 jobs:
   verify-pipeline:
+    # GitHub prepara una maquina nueva: no depende de nuestro Colab.
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -29,6 +35,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
+      # Primera fase: obtener, validar y preparar los datos.
+      # Si la validacion falla, no tiene sentido entrenar el modelo.
       - name: Extraer datos
         run: python -m src.data.extract
 
@@ -41,14 +49,19 @@ jobs:
       - name: Auditar valores extremos
         run: python -m src.data.preprocess
 
+      # Segunda fase: reconstruir MLflow (SQLite y artefactos) desde cero.
+      # No subimos mlflow.db ni mlruns al repositorio.
       - name: Entrenar candidatos y registrar ejecuciones MLflow
         run: python -m src.models.train
 
       - name: Registrar mejor modelo
         run: python -m src.models.register_model
 
+      # El Quality Gate compara el campeon con un modelo de referencia.
+      # Solo se asigna el alias champion si supera la evaluacion.
       - name: Evaluar modelo y aplicar puerta de calidad
         run: python -m src.models.evaluate_model
 
+      # Ultima fase: verificar las respuestas HTTP de la API con Pytest.
       - name: Verificar API con Pytest
         run: python -m pytest tests/test_api.py -v
