@@ -1,4 +1,5 @@
 import pytest
+from uuid import UUID
 import pandas as pd
 from fastapi.testclient import TestClient
 
@@ -89,3 +90,29 @@ def test_error_interno(cliente, registro):
 
     assert respuesta.status_code == 500
     assert respuesta.json()["detail"] == "Prediction error."
+    assert respuesta.headers.get("x-request-id")
+
+
+def test_request_id_unico(cliente, registro):
+    # Cada peticion debe tener un identificador valido y diferente.
+    primera = cliente.post("/predict", json=registro)
+    segunda = cliente.post("/predict", json=registro)
+
+    assert primera.status_code == 200
+    assert segunda.status_code == 200
+
+    id_primera = primera.headers["x-request-id"]
+    id_segunda = segunda.headers["x-request-id"]
+
+    assert UUID(id_primera).version == 4
+    assert UUID(id_segunda).version == 4
+    assert id_primera != id_segunda
+
+
+def test_request_id_con_entrada_incorrecta(cliente, registro):
+    # La trazabilidad tambien debe funcionar cuando Pydantic rechaza datos.
+    registro["age"] = "hola"
+    respuesta = cliente.post("/predict", json=registro)
+
+    assert respuesta.status_code == 422
+    assert UUID(respuesta.headers["x-request-id"]).version == 4
