@@ -1560,3 +1560,584 @@ def create_features(df):
 
     return df_eng
 ````
+
+### Archivo: `src/data/preprocess.py`
+
+````python
+
+import pandas as pd
+from pathlib import Path
+from src.data.features import create_features
+
+
+def audit_outliers(df):
+    # Añadir las nuevas características
+    df_eng = create_features(df)
+    X = df_eng.drop(columns=['target'])
+
+    # Calcular umbrales estadísticos
+    p1 = X.quantile(0.01)
+    p99 = X.quantile(0.99)
+
+    # Identificar valores extremos
+    mask = (X < p1) | (X > p99)
+
+    # Crear un informe por característica
+    report = pd.DataFrame({
+        'feature': X.columns,
+        'p1': p1.values,
+        'p99': p99.values,
+        'outliers': mask.sum().values
+    })
+
+    affected = mask.any(axis=1).sum()
+
+    return report, affected
+
+
+def main():
+    df = pd.read_csv("data/processed/diabetes_clean.csv")
+
+    report, affected = audit_outliers(df)
+
+    # Guardar el informe
+    Path("reports").mkdir(parents=True, exist_ok=True)
+    report.to_csv("reports/outliers.csv", index=False)
+
+    print("Total de pacientes:", len(df))
+    print("Pacientes con valores extremos:", affected)
+    print("Porcentaje:", round(affected / len(df) * 100, 2), "%")
+    print("Decisión: conservar todos los registros.")
+    print("Informe guardado en reports/outliers.csv")
+
+
+if __name__ == "__main__":
+    main()
+````
+
+### Archivo: `src/data/validate.py`
+
+````python
+
+import pandas as pd
+from pydantic import BaseModel, ValidationError, ConfigDict
+
+
+# 1. Definir el esquema
+class DiabetesData(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    age: float
+    sex: float
+    bmi: float
+    bp: float
+    s1: float
+    s2: float
+    s3: float
+    s4: float
+    s5: float
+    s6: float
+    target: float
+
+
+# 2. Validar cada fila
+def validate_row(row, index):
+    try:
+        DiabetesData(**row)
+        return True
+
+    except ValidationError as e:
+        print(f"Error in row {index}: {e}")
+        return False
+
+
+# 3. Validar el dataset
+def validate_dataset(df):
+    total = len(df)
+    valid = 0
+    invalid = 0
+
+    for index, row in enumerate(df.to_dict("records")):
+        if validate_row(row, index):
+            valid += 1
+        else:
+            invalid += 1
+
+    print("\n--- Validation Summary ---")
+    print(f"Total rows: {total}")
+    print(f"Valid rows: {valid}")
+    print(f"Invalid rows: {invalid}")
+
+    return invalid == 0 and total > 0
+
+
+# 4. Función principal
+def main():
+    df = pd.read_csv("data/raw/diabetes.csv")
+
+    if not validate_dataset(df):
+        raise SystemExit(1)
+
+    print("Data Validation Passed!")
+
+
+if __name__ == "__main__":
+    main()
+````
+
+### Archivo: `src/models/evaluate_model.py`
+
+````python
+
+import mlflow
+from src.models.train import prepare_data
+from sklearn.dummy import DummyRegressor
+from sklearn.metrics import mean_squared_error
+from mlflow import MlflowClient
+
+REGISTERED_MODEL_NAME = "DiabetesRegressionModel"
+MODEL_VERSION = "1"
+EXPERIMENT_NAME = "Diabetes_Regression"
+
+
+def passes_quality_gate(result, X_train, X_test, y_train, y_test):
+
+    # 1. Crear el modelo de referencia
+    baseline = DummyRegressor(strategy="mean")
+    baseline.fit(X_train, y_train)
+
+    # 2. Calcular el error del baseline
+    predicciones_baseline = baseline.predict(X_test)
+
+    rmse_baseline = mean_squared_error(
+        y_test, predicciones_baseline
+    ) ** 0.5
+
+    # 3. Recuperar el error del modelo registrado
+    rmse_modelo = result.metrics["root_mean_squared_error"]
+
+    # 4. Comparar ambos modelos
+    aprobado = rmse_modelo < rmse_baseline
+
+    # 5. Guardar el resultado en MLflow
+    mlflow.log_metric("rmse_baseline", rmse_baseline)
+    mlflow.log_metric("rmse_champion", rmse_modelo)
+
+    mlflow.set_tag(
+        "quality_gate",
+        "passed" if aprobado else "failed"
+    )
+
+    print("RMSE baseline:", round(rmse_baseline, 2))
+    print("RMSE campeón:", round(rmse_modelo, 2))
+    print("Quality Gate superado:", aprobado)
+
+    return aprobado
+
+
+def assign_champion_alias(client, model_name, model_version):
+
+    # Asignar el alias al modelo aprobado
+    client.set_registered_model_alias(
+        name=model_name,
+        alias="champion",
+        version=model_version
+    )
+
+    # Documentar el tipo de aprobación
+    client.set_model_version_tag(
+        name=model_name,
+        version=model_version,
+        key="validation_status",
+        value="passed_educational_gate"
+    )
+
+    print("Alias champion asignado a la versión:", model_version)
+
+
+def evaluate_registered_model():
+    # 1. Configurar MLflow
+    mlflow.set_tracking_uri("sqlite:///mlflow.db")
+    mlflow.set_experiment(EXPERIMENT_NAME)
+
+    # 2. Localizar el modelo registrado
+    model_uri = f"models:/{REGISTERED_MODEL_NAME}/{MODEL_VERSION}"
+
+    # 3. Preparar los datos reservados para prueba
+    X_train, X_test, y_train, y_test = prepare_data()
+
+    eval_data = X_test.copy()
+    eval_data["target"] = y_test.values
+
+    # 4. Crear una ejecución independiente de evaluación
+    with mlflow.start_run(run_name="evaluation_v1"):
+
+        mlflow.set_tags({
+            "stage": "evaluation",
+            "model_version": MODEL_VERSION,
+            "registered_model_name": REGISTERED_MODEL_NAME
+        })
+
+        # 5. Evaluar con MLflow utilizando la estructura de configuración correcta
+        result = mlflow.models.evaluate(
+            model=model_uri,
+            data=eval_data,
+            targets="target",
+            model_type="regressor",
+            evaluators=["default"],
+            evaluator_config={"default": {"log_explainer": False}}
+        )
+
+        # 6. Mostrar resultados
+        print("Modelo:", REGISTERED_MODEL_NAME)
+        print("Versión:", MODEL_VERSION)
+        print("Pacientes evaluados:", len(X_test))
+
+        for metrica, valor in result.metrics.items():
+            print(metrica, ":", round(valor, 4))
+        
+        
+        # 7. Comprobar la puerta de calidad
+        aprobado = passes_quality_gate(
+            result,
+            X_train,
+            X_test,
+            y_train,
+            y_test
+        )
+
+        print("Resultado final:", "APROBADO" if aprobado else "RECHAZADO")
+
+
+        # 8. Promocionar únicamente si supera el Quality Gate
+        if aprobado:
+            client = MlflowClient()
+
+            assign_champion_alias(
+                client,
+                REGISTERED_MODEL_NAME,
+                MODEL_VERSION
+            )
+        else:
+            print("Modelo no promocionado: Quality Gate rechazado")
+
+
+
+    return result
+
+
+if __name__ == "__main__":
+    evaluate_registered_model()
+````
+
+### Archivo: `src/models/register_model.py`
+
+````python
+
+import mlflow
+from mlflow import MlflowClient
+
+EXPERIMENT_NAME = "Diabetes_Regression"
+
+
+def get_best_run(client, experiment_name):
+    # Buscar el experimento
+    experiment = client.get_experiment_by_name(experiment_name)
+
+    if experiment is None:
+        raise ValueError("Experimento no encontrado")
+
+    # Ordenar las ejecuciones por RMSE CV
+    runs = client.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        filter_string="attributes.status = 'FINISHED'",
+        order_by=["metrics.rmse_cv ASC"]
+    )
+
+    # Seleccionar la primera ejecución con modelo guardado
+    for run in runs:
+        if "rmse_cv" in run.data.metrics and run.data.tags.get("model_uri"):
+            return run
+
+    raise ValueError("No hay modelos válidos registrados")
+
+# Nombre del modelo en el registro
+REGISTERED_MODEL_NAME = "DiabetesRegressionModel"
+
+
+def register_model(client, best_run):
+    # Recuperar el modelo previamente guardado
+    model_uri = best_run.data.tags["model_uri"]
+
+    # Crear una versión en el Model Registry
+    model_version = mlflow.register_model(
+        model_uri=model_uri,
+        name=REGISTERED_MODEL_NAME
+    )
+
+    # Pendiente de evaluación final
+    client.set_model_version_tag(
+        name=model_version.name,
+        version=model_version.version,
+        key="validation_status",
+        value="pending"
+    )
+
+    return model_version
+
+
+def add_model_description(client, best_run, model_version):
+    # Recuperar información del experimento
+    metrics = best_run.data.metrics
+    params = best_run.data.params
+
+    # Preparar la descripción del modelo
+    description = (
+        f"Modelo seleccionado: {params['modelo']}\n"
+        f"RMSE CV (5 folds): {metrics['rmse_cv']:.2f}\n"
+        f"Características: {params['features']}\n"
+        f"Pacientes de entrenamiento: 353\n"
+        f"Pacientes reservados para prueba: 89\n"
+        f"Run ID: {best_run.info.run_id}\n"
+        f"Estado: pendiente de evaluación final."
+    )
+
+    # Actualizar la descripción de la versión registrada
+    client.update_model_version(
+        name=model_version.name,
+        version=model_version.version,
+        description=description
+    )
+
+    print("Descripción del modelo actualizada")
+
+
+def main():
+    mlflow.set_tracking_uri("sqlite:///mlflow.db")
+    client = MlflowClient()
+
+    best_run = get_best_run(client, EXPERIMENT_NAME)
+
+    print("Campeón:", best_run.data.params["modelo"])
+    print("RMSE CV:", round(best_run.data.metrics["rmse_cv"], 2))
+    print("URI:", best_run.data.tags["model_uri"])
+
+
+    model_version = register_model(client, best_run)
+
+    print("Modelo registrado:", model_version.name)
+    print("Versión:", model_version.version)
+
+
+
+if __name__ == "__main__":
+    main()
+````
+
+### Archivo: `src/models/train.py`
+
+````python
+
+import mlflow
+import pandas as pd
+import mlflow.sklearn
+from mlflow.models import infer_signature
+from sklearn.model_selection import train_test_split, KFold, cross_val_score
+from src.data.features import create_features
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+
+# 1. Preparar los datos
+def prepare_data():
+    df = pd.read_csv("data/processed/diabetes_clean.csv")
+    df_eng = create_features(df)
+    X = df_eng.drop(columns=['target'])
+    y = df_eng['target']
+    return train_test_split(X, y, test_size=0.2, random_state=42)
+
+# 2. Función principal
+def main():
+    X_train, X_test, y_train, y_test = prepare_data()
+
+    print("Entrenamiento:", X_train.shape)
+    print("Prueba:", X_test.shape)
+
+    modelos = {
+        "LinearRegression": LinearRegression(),
+        "RandomForest": RandomForestRegressor(random_state=42),
+        "GradientBoosting": GradientBoostingRegressor(random_state=42)
+    }
+
+    print("Modelos candidatos:", list(modelos.keys()))
+
+    cv = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    mlflow.set_tracking_uri("sqlite:///mlflow.db")
+    mlflow.set_experiment("Diabetes_Regression")
+
+    for nombre, modelo in modelos.items():
+        with mlflow.start_run(run_name=f"{nombre}_CV"):
+            resultados = cross_val_score(
+                modelo,
+                X_train,
+                y_train,
+                cv=cv,
+                scoring="neg_root_mean_squared_error"
+            )
+
+            rmse_cv = -resultados.mean()
+
+            mlflow.log_param("modelo", nombre)
+            mlflow.log_param("features", X_train.shape[1])
+            mlflow.log_param("n_splits", 5)
+            mlflow.log_metric("rmse_cv", rmse_cv)
+
+            print(nombre, "RMSE CV:", round(rmse_cv, 2))
+
+            # Entrenar el modelo definitivo con X_train
+            modelo.fit(X_train, y_train)
+
+            # Definir un ejemplo y la firma de entrada/salida
+            ejemplo = X_train.head(5)
+            firma = infer_signature(ejemplo, modelo.predict(ejemplo))
+
+            # Guardar el modelo en MLflow permitiendo tipos de confianza para skops
+            info_modelo = mlflow.sklearn.log_model(
+                sk_model=modelo,
+                name="model",
+                signature=firma,
+                input_example=ejemplo,
+                registered_model_name=None,
+                skops_trusted_types=["sklearn.tree._tree.Tree"]
+            )
+
+            # Guardar una referencia para recuperarlo
+            mlflow.set_tag("model_uri", info_modelo.model_uri)
+            print(nombre, "guardado:", info_modelo.model_uri)
+
+if __name__ == "__main__":
+    main()
+````
+
+### Archivo: `tests/test_api.py`
+
+````python
+import pytest
+from uuid import UUID
+import pandas as pd
+from fastapi.testclient import TestClient
+
+from src.api.main import app
+
+
+COLUMNAS = [
+    "age", "sex", "bmi", "bp",
+    "s1", "s2", "s3", "s4", "s5", "s6"
+]
+
+
+@pytest.fixture(scope="module")
+def cliente():
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture
+def registro():
+    datos = pd.read_csv("data/processed/diabetes_clean.csv")
+    return {
+        columna: float(datos.loc[0, columna])
+        for columna in COLUMNAS
+    }
+
+
+def test_health(cliente):
+    respuesta = cliente.get("/health")
+    assert respuesta.status_code == 200
+
+
+def test_prediccion_valida(cliente, registro):
+    respuesta = cliente.post("/predict", json=registro)
+    assert respuesta.status_code == 200
+    assert isinstance(respuesta.json()["prediction"], float)
+
+
+def test_tipo_incorrecto(cliente, registro):
+    registro["age"] = "hola"
+    respuesta = cliente.post("/predict", json=registro)
+    assert respuesta.status_code == 422
+
+
+def test_campo_ausente(cliente, registro):
+    del registro["bmi"]
+    respuesta = cliente.post("/predict", json=registro)
+    assert respuesta.status_code == 422
+
+
+def test_campo_extra(cliente, registro):
+    registro["nombre"] = "Don Quijote"
+    respuesta = cliente.post("/predict", json=registro)
+    assert respuesta.status_code == 422
+
+
+def test_nan(cliente, registro):
+    registro["age"] = "NaN"
+    respuesta = cliente.post("/predict", json=registro)
+    assert respuesta.status_code == 422
+
+
+def test_model_info(cliente):
+    respuesta = cliente.get("/model-info")
+
+    assert respuesta.status_code == 200
+
+    datos = respuesta.json()
+
+    assert datos["model_name"] == "DiabetesRegressionModel"
+    assert datos["version"] == "1"
+    assert datos["alias"] == "champion"
+    assert datos["run_id"]
+
+
+def test_error_interno(cliente, registro):
+    from unittest.mock import patch
+
+    class ModeloQueFalla:
+        def predict(self, datos):
+            raise ValueError("Fallo simulado")
+
+    with patch(
+        "src.api.main.get_model",
+        return_value=ModeloQueFalla()
+    ):
+        respuesta = cliente.post("/predict", json=registro)
+
+    assert respuesta.status_code == 500
+    assert respuesta.json()["detail"] == "Prediction error."
+    assert respuesta.headers.get("x-request-id")
+
+
+def test_request_id_unico(cliente, registro):
+    # Cada peticion debe tener un identificador valido y diferente.
+    primera = cliente.post("/predict", json=registro)
+    segunda = cliente.post("/predict", json=registro)
+
+    assert primera.status_code == 200
+    assert segunda.status_code == 200
+
+    id_primera = primera.headers["x-request-id"]
+    id_segunda = segunda.headers["x-request-id"]
+
+    assert UUID(id_primera).version == 4
+    assert UUID(id_segunda).version == 4
+    assert id_primera != id_segunda
+
+
+def test_request_id_con_entrada_incorrecta(cliente, registro):
+    # La trazabilidad tambien debe funcionar cuando Pydantic rechaza datos.
+    registro["age"] = "hola"
+    respuesta = cliente.post("/predict", json=registro)
+
+    assert respuesta.status_code == 422
+    assert UUID(respuesta.headers["x-request-id"]).version == 4
+````
